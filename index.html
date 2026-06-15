@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>VIPBroc — V3 Firebase</title>
+<title>VIPBroc — V3.1 Firebase</title>
 <style>
 :root{--cream:#fff7eb;--paper:#fffdf8;--ink:#251c14;--muted:#745f4c;--gold:#d79a2e;--green:#1b8f5a;--red:#d93025;--blue:#1b65d8;--shadow:0 18px 48px rgba(70,40,15,.18);--radius:26px}
 *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:linear-gradient(155deg,#fff7eb,#ead4b6);color:var(--ink);font-size:19px} button,input,textarea{font:inherit} .app{max-width:520px;min-height:100svh;margin:auto;background:rgba(255,253,248,.92);box-shadow:0 0 0 1px rgba(0,0,0,.04);position:relative;overflow:hidden}
@@ -55,8 +55,43 @@ function posFromEvent(e,box){const r=box.getBoundingClientRect(); const p=e.touc
 $('editMap').addEventListener('pointerdown',e=>{posFromEvent(e,$('editMap')); $('editMap').setPointerCapture(e.pointerId)}); $('editMap').addEventListener('pointermove',e=>{if(e.pressure>0 || e.buttons)posFromEvent(e,$('editMap'))});
 $('photoInput').addEventListener('change',async e=>{const f=e.target.files[0]; if(!f)return; try{state.photoReady=false; state.photo=await compressImage(f,200); $('photoPreview').src=state.photo; $('photoPreview').style.display='block'; state.photoReady=true; toast('Photo compressée')}catch(err){toast('Erreur photo')} });
 function compressImage(file,targetKB=200){return new Promise((resolve,reject)=>{const img=new Image(); const rd=new FileReader(); rd.onload=()=>img.src=rd.result; rd.onerror=reject; img.onload=()=>{const maxW=900; const scale=Math.min(1,maxW/img.width); const c=document.createElement('canvas'); c.width=Math.round(img.width*scale); c.height=Math.round(img.height*scale); const ctx=c.getContext('2d'); ctx.drawImage(img,0,0,c.width,c.height); let q=.82, data=c.toDataURL('image/jpeg',q); while(data.length/1024>targetKB*1.37 && q>.35){q-=.06; data=c.toDataURL('image/jpeg',q)} resolve(data)}; img.onerror=reject; rd.readAsDataURL(file)})}
-async function uploadPhoto(dataUrl,id){try{const ref=storage.ref().child(`vipbroc/lemans/${id}.jpg`); await ref.putString(dataUrl,'data_url'); return await ref.getDownloadURL();}catch(e){console.warn('Storage indisponible, stockage base64 dans Database',e); return dataUrl;}}
-async function finalize(){if(!state.photoReady || !state.photo){toast('Photo non détectée');return} const id=String(Date.now()); const item={id,x:state.x,y:state.y,title:$('title').value.trim()||'Objet brocante',price:$('price').value.trim(),desc:$('desc').value.trim(),createdAt:Date.now()}; toast('Envoi en cours...'); item.photo=await uploadPhoto(state.photo,id); await db.ref(DB_PATH+'/objets/'+id).set(item); $('title').value='';$('price').value='';$('desc').value='';$('photoInput').value='';$('photoPreview').style.display='none'; state.photo='';state.photoReady=false; toast('Objet en ligne sur VIPBroc'); go('lemans')}
+// V3.1 : pour éviter le blocage Storage pendant les tests, la photo compressée est stockée directement dans Realtime Database.
+// Elle fait environ 200 ko. Plus tard, on remettra Firebase Storage quand les règles Storage seront propres.
+const USE_STORAGE = false;
+function timeout(ms){return new Promise((_,reject)=>setTimeout(()=>reject(new Error('timeout')),ms));}
+async function uploadPhoto(dataUrl,id){
+  if(!USE_STORAGE) return dataUrl;
+  try{
+    const ref=storage.ref().child(`vipbroc/lemans/${id}.jpg`);
+    await Promise.race([ref.putString(dataUrl,'data_url'), timeout(7000)]);
+    return await Promise.race([ref.getDownloadURL(), timeout(7000)]);
+  }catch(e){
+    console.warn('Storage indisponible ou trop lent, stockage base64 dans Database',e);
+    return dataUrl;
+  }
+}
+async function finalize(){
+  if(!state.photoReady || !state.photo){toast('Photo non détectée');return}
+  const btn=event && event.target ? event.target : null;
+  if(btn){btn.disabled=true;btn.textContent='Envoi...'}
+  const id=String(Date.now());
+  const item={id,x:state.x,y:state.y,title:$('title').value.trim()||'Objet brocante',price:$('price').value.trim(),desc:$('desc').value.trim(),createdAt:Date.now()};
+  try{
+    toast('Envoi en cours...');
+    item.photo=await uploadPhoto(state.photo,id);
+    await db.ref(DB_PATH+'/objets/'+id).set(item);
+    $('title').value='';$('price').value='';$('desc').value='';$('photoInput').value='';$('photoPreview').style.display='none';
+    state.photo='';state.photoReady=false;
+    toast('Objet en ligne sur VIPBroc');
+    go('buyers');
+  }catch(e){
+    console.error(e);
+    toast('Erreur Firebase : vérifie les Rules');
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='Finaliser'}
+  }
+}
+function showBuyers(){go('buyers')}
 function renderBuyers(){$('openBadge').textContent=state.open?'Accès ouvert':'Accès verrouillé'; $('openBadge').className=state.open?'badge':'badge red'; if(!state.open){$('buyerContent').innerHTML='<div class="card lock"><div class="big">🔒</div><h2>Accès verrouillé</h2><p>Les objets seront visibles à 7h quand l’organisateur ouvrira l’accès acheteurs.</p></div>';return} if(!state.items.length){$('buyerContent').innerHTML='<div class="card"><p>Aucun objet publié pour le moment.</p></div>';return} $('buyerContent').innerHTML='<div class="objectGrid">'+state.items.map(it=>`<div class="obj" onclick="showOnMap(${it.x},${it.y})"><img src="${it.photo}"><div><strong>${escapeHtml(it.title)}</strong><br><span>${escapeHtml(it.price||'Prix non indiqué')}</span><p class="hint">${escapeHtml(it.desc||'')}</p><span class="badge">Voir sur le plan</span></div></div>`).join('')+'</div>';}
 function showOnMap(x,y){$('viewPin').style.left=x+'%'; $('viewPin').style.top=y+'%'; $('viewCoord').textContent=`Position objet : X ${Number(x).toFixed(1)} % / Y ${Number(y).toFixed(1)} %`; go('mapView')}
 function adminAsk(){const code=prompt('Code maître ?'); if(code==='broc' || code==='ppms' || code==='supp')go('admin'); else if(code)toast('Code incorrect')}
